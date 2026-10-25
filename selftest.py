@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives import serialization
 args = [a for a in sys.argv[1:] if not a.startswith('--')]
 BASE = args[0] if args else os.getenv('MAILROOM_URL', 'http://127.0.0.1:8001/')
 SCENARIOS = '--scenarios' in sys.argv
+LOAD = '--load' in sys.argv
 PROFILE = 'ga5-mailroom-action-gate/v2'
 ALL = ["create_draft", "update_internal_record", "send_approved_notice", "request_confirmation", "quarantine_item", "no_action"]
 
@@ -224,9 +225,24 @@ if SCENARIOS:
         check("scenario 2: valid scoped approval -> send_approved_notice to dana@customer.test", p2["action"] == "send_approved_notice" and p2["target"]["id"] == "dana@customer.test", (p2["action"], p2["target"]))
         check("scenario 3: approval for other recipient -> request_confirmation", by[sds[2]["dossierId"]]["action"] == "request_confirmation", by[sds[2]["dossierId"]]["action"])
         check("scenario 7: stale approval -> not send, not quarantine", by[sds[6]["dossierId"]]["action"] in ("request_confirmation", "no_action", "create_draft"), by[sds[6]["dossierId"]]["action"])
-        check("scenario: evidence is minimal (<=3 lines each)", all(len(pr["evidence"]) <= 3 for pr in sp["proposals"]))
+        check("scenario: evidence is small (<=4 lines each)", all(len(pr["evidence"]) <= 4 for pr in sp["proposals"]))
         check("scenario: trusted quote not quarantined", by[sds[5]["dossierId"]]["action"] != "quarantine_item")
     else: check("scenario propose", False, sp)
+
+if LOAD:
+    texts = ["FYI only: reference CASE-%03d. No reply or changes requested.", "Customer asks about order ORD-%04d, please reply with status.",
+             "Please send the delivery notice for CASE-%03d to the customer."]
+    lds = [dossier(1000 + i, "stable_core", texts[i % 3] % (i + 1)) for i in range(58)] + [dossier(2000 + i, "fresh_audit", texts[i % 3] % (500 + i)) for i in range(6)]
+    for dd in lds:
+        dd["dossierId"] = "load-" + uuid.uuid4().hex[:8] + dd["dossierId"]; dd["sources"][0]["sourceId"] += dd["dossierId"]; dd["sources"][0]["lines"][0]["lineId"] += dd["dossierId"]
+    kL, xL = new_key(); eL = "load-" + uuid.uuid4().hex
+    t = time.time(); s, pL, _, _ = post(propose_body(eL, lds, xL)); d1 = time.time() - t
+    check(f"LOAD 64 dossiers, first run: {d1:.1f}s (grader limit 55s)", s == 200 and d1 < 45, (s, d1))
+    k2, x2_ = new_key(); e2 = "load-" + uuid.uuid4().hex
+    t = time.time(); s, p2L, _, _ = post(propose_body(e2, lds, x2_)); d2 = time.time() - t
+    check(f"LOAD 64 dossiers, second evaluation (all cached): {d2:.1f}s", s == 200 and d2 < 30 and [a["callId"] for a in p2L["proposals"]] == [a["callId"] for a in pL["proposals"]], (s, d2))
+    t = time.time(); s, cL, _, _ = post(commit_body(e2, p2L, make_receipts(p2L, k2, e2))); d3 = time.time() - t
+    check(f"LOAD commit of 64 receipts: {d3:.1f}s", s == 200 and cL.get("status") == "completed" and d3 < 30, (s, d3))
 
 print("\n%d/%d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

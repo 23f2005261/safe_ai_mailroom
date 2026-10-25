@@ -105,16 +105,26 @@ initialize()
 if MOCK: log.warning('*** MOCK_MODEL=1: the AI model is DISABLED. Never deploy or grade like this. ***')
 if DEBUG_STATS: log.warning('DEBUG_STATS=1 is on (local testing only)')
 
-def cache_get(c, d):
-    r = c.x('SELECT proposal_json FROM dossier_cache WHERE dossier_id=? AND fingerprint=?',
-            (d['dossierId'], digest(d))).fetchone()
-    return json.loads(r['proposal_json']) if r else None
+def cache_get_many(c, ds):
+    """ONE query for any number of dossiers (round trips to the remote DB are the slow part)."""
+    if not ds: return {}
+    ids = sorted({d['dossierId'] for d in ds})
+    rows = c.x('SELECT dossier_id,fingerprint,proposal_json FROM dossier_cache WHERE dossier_id IN (%s)' % ','.join('?' * len(ids)), ids).fetchall()
+    have = {(r['dossier_id'], r['fingerprint']): r['proposal_json'] for r in rows}
+    out = {}
+    for d in ds:
+        j = have.get((d['dossierId'], digest(d)))
+        if j: out[d['dossierId']] = json.loads(j)
+    return out
 
-def cache_put(c, d, p):
-    """Insert-if-absent, then read back the winner so concurrent evaluations agree on one callId."""
-    c.x('INSERT INTO dossier_cache(dossier_id,fingerprint,proposal_json) VALUES(?,?,?) ON CONFLICT DO NOTHING',
-        (d['dossierId'], digest(d), canonical(p)))
-    return cache_get(c, d)
+def cache_put_many(c, items):
+    """Insert-if-absent in ONE statement, then read back the winners so concurrent evaluations agree on one callId."""
+    if not items: return {}
+    vals, args = [], []
+    for d, p in items:
+        vals.append('(?,?,?)'); args += [d['dossierId'], digest(d), canonical(p)]
+    c.x('INSERT INTO dossier_cache(dossier_id,fingerprint,proposal_json) VALUES %s ON CONFLICT DO NOTHING' % ','.join(vals), args)
+    return cache_get_many(c, [d for d, _ in items])
 
 
 # ---------------------------------------------------------------- request validation
@@ -330,7 +340,7 @@ def decide_chunk(chunk, deadline):
             done[did] = fallback(d)
     by_id = {d['dossierId']: d for d in chunk}
     with Conn() as c:
-        return {did: cache_put(c, by_id[did], p) for did, p in done.items()}
+        return cache_put_many(c, [(by_id[did], p) for did, p in done.items()])
 
 def generate(missing, cached, deadline):
     if deadline - time.monotonic() < 4: raise ModelUnavailable()
@@ -364,20 +374,15 @@ def propose(b, t0):
         with Conn() as c:
             r = stored_eval(c, eid, rh)
             if r: return r
-            for d in b['dossiers']:
-                hit = cache_get(c, d)
-                if hit: cached[d['dossierId']] = hit
-                else: missing.append(d)
+            cached = cache_get_many(c, b['dossiers'])
+            missing = [d for d in b['dossiers'] if d['dossierId'] not in cached]
         if missing:
             if not _gen_lock.acquire(timeout=max(1.0, deadline - time.monotonic() - 6)):
                 return fail('BUSY', 503)
             try:
                 with Conn() as c:          # another evaluation may have just filled the cache
-                    still = []
-                    for d in missing:
-                        hit = cache_get(c, d)
-                        if hit: cached[d['dossierId']] = hit
-                        else: still.append(d)
+                    cached.update(cache_get_many(c, missing))
+                    still = [d for d in missing if d['dossierId'] not in cached]
                 if still:
                     try: generate(still, cached, deadline)
                     except ModelUnavailable: return fail('PROPOSAL_UNAVAILABLE', 503)
@@ -392,8 +397,8 @@ def propose(b, t0):
                       (eid, rh, ih, canonical(b['receiptVerifier']), 'awaiting_receipts', text))
             if ins.rowcount == 0:
                 return stored_eval(c, eid, rh) or fail('EVALUATION_CONFLICT', 409)
-            for p in proposals:
-                c.x('INSERT INTO evaluation_proposals(evaluation_id,dossier_id,proposal_json) VALUES(?,?,?) ON CONFLICT DO NOTHING', (eid, p['dossierId'], canonical(p)))
+            c.x('INSERT INTO evaluation_proposals(evaluation_id,dossier_id,proposal_json) VALUES %s ON CONFLICT DO NOTHING' % ','.join(['(?,?,?)'] * len(proposals)),
+                [v for p in proposals for v in (eid, p['dossierId'], canonical(p))])
         return jr(text)
 
 
@@ -451,8 +456,8 @@ def commit(b):
             if upd.rowcount == 0:
                 cur = c.x('SELECT commit_hash,commit_json FROM evaluations WHERE evaluation_id=?', (eid,)).fetchone()
                 return jr(cur['commit_json']) if cur['commit_hash'] == rh else fail('COMMIT_CONFLICT', 409)
-            for r in receipts:
-                c.x('INSERT INTO evaluation_receipts(evaluation_id,dossier_id,receipt_json) VALUES(?,?,?) ON CONFLICT DO NOTHING', (eid, r['dossierId'], canonical(r)))
+            c.x('INSERT INTO evaluation_receipts(evaluation_id,dossier_id,receipt_json) VALUES %s ON CONFLICT DO NOTHING' % ','.join(['(?,?,?)'] * len(receipts)),
+                [v for r in receipts for v in (eid, r['dossierId'], canonical(r))])
         return jr(text)
 
 
