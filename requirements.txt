@@ -3,3 +3,4 @@ uvicorn==0.34.0
 google-genai==1.75.0
 python-dotenv==1.0.1
 cryptography==45.0.4
+psycopg2-binary

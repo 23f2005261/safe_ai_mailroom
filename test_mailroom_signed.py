@@ -2,7 +2,7 @@ import json, hashlib, base64, uuid, urllib.request, urllib.error
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
-URL = "http://127.0.0.1:8001/"
+URL = "https://safe-ai-mailroom-vekv.onrender.com/"
 PROFILE = "ga5-mailroom-action-gate/v2"
 def canon(x): return json.dumps(x, sort_keys=True, separators=(",",":"), ensure_ascii=False, allow_nan=False)
 def sha(x): return hashlib.sha256(canon(x).encode()).hexdigest()
